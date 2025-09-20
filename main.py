@@ -3,6 +3,7 @@ import requests
 from tqdm import tqdm
 import pylrc
 import json
+import argparse
 
 from PIL import Image
 from multiprocessing import Pool, Manager
@@ -11,6 +12,11 @@ from mutagen.id3 import APIC, SYLT, Encoding, ID3
 from mutagen.flac import Picture, FLAC
 from pydub import AudioSegment
 
+def get_target_format():
+    parser = argparse.ArgumentParser(description='Downloads music directly from the Monster Siren Records website.')
+    parser.add_argument('format', nargs='?', default='flac', choices=['flac', 'mp3', 'wav'], help='target format for the songs the api provides as .wav (default: flac)')
+    args = parser.parse_args()
+    return args.format
 
 def make_valid(filename):
     # Make a filename valid in different OSs
@@ -98,7 +104,7 @@ def fill_metadata(filename, filetype, album, title, albumartist, artist, tracknu
     return 
 
 
-def download_song(session, directory, name, url):
+def download_song(session, directory, name, url, target_format):
     source = session.get(url, stream=True)
     filename = directory + '/' + make_valid(name)
     filetype = ''
@@ -122,21 +128,32 @@ def download_song(session, directory, name, url):
             size = f.write(data)
             bar.update(size)
 
-    # If file is .wav then export to .flac
+    # If file is .wav then export to desired format
     if source.headers['content-type'] != 'audio/mpeg':
-        AudioSegment.from_wav(filename).export(directory + '/' + make_valid(name) + '.flac', format='flac')
+        if target_format == 'flac':
+            AudioSegment.from_wav(filename).export(
+                directory + '/' + make_valid(name) + '.flac', 
+                format='flac'
+            )
+        if target_format == 'mp3':
+            AudioSegment.from_wav(filename).export(
+                directory + '/' + make_valid(name) + '.mp3', 
+                format='mp3',
+                bitrate='320k'
+            )
         os.remove(filename)
-        filename = directory + '/' + make_valid(name) + '.flac'
-        filetype = '.flac'
-
+        filename = directory + '/' + make_valid(name) + '.' + target_format
+        filetype = '.' + target_format
+        
     return filename, filetype
 
 
-def download_album( args):
+def download_album(args):
     directory = args['directory']
     session = args['session']
     queue = args['queue']
     mutex = args['mutex']
+    target_format = args['target_format']
 
     album_cid = args['cid']
     album_name = args['name']
@@ -191,7 +208,7 @@ def download_album( args):
             songlyricpath = None
 
         # Download song and fill out metadata
-        filename, filetype = download_song(session=session, directory=directory + make_valid(album_name), name=song_name, url=song_sourceUrl)
+        filename, filetype = download_song(session=session, directory=directory + make_valid(album_name), name=song_name, url=song_sourceUrl, target_format=target_format)
         fill_metadata(filename=filename,
                         filetype=filetype,
                         album=album_name,
@@ -214,6 +231,7 @@ def main():
     manager = Manager()
     queue = manager.Queue()
     mutex = manager.Lock()
+    target_format = get_target_format()
 
     try:
         os.mkdir(directory)
@@ -228,6 +246,7 @@ def main():
         album['session'] = session
         album['queue'] = queue
         album['mutex'] = mutex
+        album['target_format'] = target_format
 
 
     with Pool(maxtasksperchild=1) as pool:
