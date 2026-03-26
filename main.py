@@ -4,6 +4,9 @@ from tqdm import tqdm
 import pylrc
 import json
 import argparse
+import subprocess
+import glob
+import shutil
 
 from PIL import Image
 from multiprocessing import Pool, Manager
@@ -12,11 +15,12 @@ from mutagen.id3 import APIC, SYLT, Encoding, ID3
 from mutagen.flac import Picture, FLAC
 from pydub import AudioSegment
 
-def get_target_format():
+def parse_arguments():
     parser = argparse.ArgumentParser(description='Downloads music directly from the Monster Siren Records website.')
     parser.add_argument('format', nargs='?', default='flac', choices=['flac', 'mp3', 'wav'], help='target format for the songs the api provides as .wav (default: flac)')
+    parser.add_argument('--rsgain', action='store_true', help='run rsgain on downloaded files after completion')
     args = parser.parse_args()
-    return args.format
+    return args.format, args.rsgain
 
 def make_valid(filename):
     # Make a filename valid in different OSs
@@ -46,21 +50,71 @@ def lyric_file_to_text(filename):
     return ret
 
 def update_downloaded_albums(queue, directory, mutex):
-    while 1:
+    """Collects albums downloaded in current session and writes to both completed_albums.json and new_albums.json"""
+    new_albums = []
+    while True:
         album_name = queue.get()
         # Final queue element, guaranteed to happen after all maps completed
-        if album_name == None:
+        if album_name is None:
             break
-        try:
-            with mutex:
-                with open(directory + 'completed_albums.json', 'r', encoding='utf8') as f:
-                    completed_albums = json.load(f)
-        except:
-            completed_albums = []
-        completed_albums.append(album_name)
+        new_albums.append(album_name)
+
+    # Read existing completed albums
+    try:
         with mutex:
-            with open(directory + 'completed_albums.json', 'w+', encoding='utf8') as f:
-                json.dump(completed_albums, f)
+            with open(directory + 'completed_albums.json', 'r', encoding='utf8') as f:
+                completed_albums = json.load(f)
+    except:
+        completed_albums = []
+
+    # Append new albums to completed_albums.json
+    completed_albums.extend(new_albums)
+    with mutex:
+        with open(directory + 'completed_albums.json', 'w+', encoding='utf8') as f:
+            json.dump(completed_albums, f)
+
+    # Write new albums from this session to new_albums.json (overwrite)
+    with mutex:
+        with open(directory + 'new_albums.json', 'w', encoding='utf8') as f:
+            json.dump(new_albums, f, ensure_ascii=False, indent=2)
+
+
+def run_rsgain(directory):
+    """Execute rsgain custom -a -si -S recursively on audio files in the download directory"""
+    # Find rsgain executable
+    rsgain_cmd = shutil.which('rsgain')
+    if rsgain_cmd is None:
+        print("Warning: rsgain not found in PATH. Please install rsgain to use this feature.")
+        return
+
+    try:
+        print("\nRunning rsgain on downloaded files...")
+        # Find all audio files recursively
+        audio_files = []
+        for ext in ['*.flac', '*.mp3', '*.wav', '*.m4a', '*.aac', '*.ogg', '*.opus', '*.wma']:
+            audio_files.extend(glob.glob(os.path.join(directory, '**', ext), recursive=True))
+
+        if not audio_files:
+            print("No audio files found for rsgain processing")
+            return
+
+        print(f"Found {len(audio_files)} audio files to process...")
+
+        # Process in batches
+        # Use a conservative batch size of 100 files per batch
+        batch_size = 100
+        total_batches = (len(audio_files) + batch_size - 1) // batch_size
+        for i in range(0, len(audio_files), batch_size):
+            batch = audio_files[i:i + batch_size]
+            print(f"Processing batch {i // batch_size + 1}/{total_batches}...")
+            subprocess.run(
+                [rsgain_cmd, 'custom', '-a', '-si', '-S'] + batch,
+                check=True
+            )
+
+        print("rsgain completed successfully")
+    except subprocess.CalledProcessError as e:
+        print(f"Error running rsgain")
 
 
 def fill_metadata(filename, filetype, album, title, albumartist, artist, tracknumber, albumcover, songlyricpath):
@@ -231,7 +285,7 @@ def main():
     manager = Manager()
     queue = manager.Queue()
     mutex = manager.Lock()
-    target_format = get_target_format()
+    target_format, use_rsgain = parse_arguments()
 
     try:
         os.mkdir(directory)
@@ -255,7 +309,11 @@ def main():
         queue.put(None)
         pool.close()
         pool.join()
-    
+
+    # Run rsgain if requested
+    if use_rsgain:
+        run_rsgain(directory)
+
     return
 
 
