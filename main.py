@@ -7,6 +7,7 @@ import argparse
 import subprocess
 import glob
 import shutil
+import sys
 
 from PIL import Image
 from multiprocessing import Pool, Manager
@@ -19,8 +20,11 @@ def parse_arguments():
     parser = argparse.ArgumentParser(description='Downloads music directly from the Monster Siren Records website.')
     parser.add_argument('format', nargs='?', default='flac', choices=['flac', 'mp3', 'wav'], help='target format for the songs the api provides as .wav (default: flac)')
     parser.add_argument('--rsgain', action='store_true', help='run rsgain on downloaded files after completion')
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--song', metavar='CID', help='download a single song by its CID')
+    group.add_argument('--album', metavar='CID', help='download a single album by its CID')
     args = parser.parse_args()
-    return args.format, args.rsgain
+    return args.format, args.rsgain, args.song, args.album
 
 def make_valid(filename):
     # Make a filename valid in different OSs
@@ -202,12 +206,23 @@ def download_song(session, directory, name, url, target_format):
     return filename, filetype
 
 
+def download_album_cover(session, album_dir, cover_url):
+    """Download album art into album_dir as cover.png, converting from jpg. Returns the cover path."""
+    with open(album_dir + '/cover.jpg', 'w+b') as f:
+        f.write(session.get(cover_url).content)
+    cover = Image.open(album_dir + '/cover.jpg')
+    cover.save(album_dir + '/cover.png')
+    os.remove(album_dir + '/cover.jpg')
+    return album_dir + '/cover.png'
+
+
 def download_album(args):
     directory = args['directory']
     session = args['session']
     queue = args['queue']
     mutex = args['mutex']
     target_format = args['target_format']
+    force = args.get('force', False)
 
     album_cid = args['cid']
     album_name = args['name']
@@ -222,7 +237,7 @@ def download_album(args):
     except:
         completed_albums = []
 
-    if album_name in completed_albums:
+    if album_name in completed_albums and not force:
         # If album is completed then skip
         print(f'Skipping downloaded album {album_name}')
         return
@@ -233,13 +248,7 @@ def download_album(args):
         pass
 
     # Download album art
-    with open(directory + make_valid(album_name) + '/cover.jpg', 'w+b') as f:
-        f.write(session.get(album_coverUrl).content)
-
-    # Change album art from .jpg to .png
-    cover = Image.open(directory + make_valid(album_name) + '/cover.jpg')
-    cover.save(directory + make_valid(album_name) + '/cover.png')
-    os.remove(directory + make_valid(album_name) + '/cover.jpg')
+    download_album_cover(session, directory + make_valid(album_name), album_coverUrl)
 
 
     songs = session.get(album_url, headers={'Accept': 'application/json'}).json()['data']['songs']
@@ -279,13 +288,80 @@ def download_album(args):
     return
 
 
+def download_single_song(session, directory, target_format, song_cid, albums):
+    """Download a single song by CID, locating its parent album for metadata and cover art."""
+    print(f'Searching for song {song_cid}...')
+    found_album = None
+    song = None
+    song_track_number = None
+
+    for album in albums:
+        album_url = 'https://monster-siren.hypergryph.com/api/album/' + album['cid'] + '/detail'
+        songs = session.get(album_url, headers={'Accept': 'application/json'}).json()['data']['songs']
+        for idx, s in enumerate(songs):
+            if s['cid'] == song_cid:
+                found_album = album
+                song = s
+                song_track_number = idx
+                break
+        if found_album is not None:
+            break
+
+    if found_album is None:
+        print(f'Error: song CID {song_cid} was not found in any album')
+        sys.exit(1)
+
+    album_name = found_album['name']
+    album_artistes = found_album['artistes']
+    album_coverUrl = found_album['coverUrl']
+    song_name = song['name']
+    song_artists = song['artistes']
+    album_dir = directory + make_valid(album_name)
+
+    try:
+        os.mkdir(album_dir)
+    except:
+        pass
+
+    download_album_cover(session, album_dir, album_coverUrl)
+
+    # Get song details (lyric + source)
+    song_url = 'https://monster-siren.hypergryph.com/api/song/' + song_cid
+    song_detail = session.get(song_url, headers={'Accept': 'application/json'}).json()['data']
+    song_lyricUrl = song_detail['lyricUrl']
+    song_sourceUrl = song_detail['sourceUrl']
+
+    # Download lyric
+    if song_lyricUrl is not None:
+        songlyricpath = album_dir + '/' + make_valid(song_name) + '.lrc'
+        with open(songlyricpath, 'w+b') as f:
+            f.write(session.get(song_lyricUrl).content)
+    else:
+        songlyricpath = None
+
+    # Download song and fill out metadata
+    filename, filetype = download_song(session=session, directory=album_dir, name=song_name, url=song_sourceUrl, target_format=target_format)
+    fill_metadata(filename=filename,
+                    filetype=filetype,
+                    album=album_name,
+                    title=song_name,
+                    albumartist=album_artistes,
+                    artist=song_artists,
+                    tracknumber=song_track_number,
+                    albumcover=album_dir + '/cover.png',
+                    songlyricpath=songlyricpath)
+
+    print(f'Downloaded song {song_name}')
+    return
+
+
 def main():
     directory = './MonsterSiren/'
     session = requests.Session()
     manager = Manager()
     queue = manager.Queue()
     mutex = manager.Lock()
-    target_format, use_rsgain = parse_arguments()
+    target_format, use_rsgain, song_cid, album_cid = parse_arguments()
 
     try:
         os.mkdir(directory)
@@ -295,20 +371,36 @@ def main():
     
     # Get all albums
     albums = session.get('https://monster-siren.hypergryph.com/api/albums', headers={'Accept': 'application/json'}).json()['data']
-    for album in albums:
-        album['directory'] = directory
-        album['session'] = session
-        album['queue'] = queue
-        album['mutex'] = mutex
-        album['target_format'] = target_format
+
+    if song_cid:
+        # Single song: locate parent album and download just that song
+        download_single_song(session, directory, target_format, song_cid, albums)
+    else:
+        # Album-level download (either a single requested album, or all albums)
+        force = False
+        if album_cid:
+            matching = [a for a in albums if a['cid'] == album_cid]
+            if not matching:
+                print(f'Error: album CID {album_cid} was not found')
+                sys.exit(1)
+            albums = matching
+            force = True
+
+        for album in albums:
+            album['directory'] = directory
+            album['session'] = session
+            album['queue'] = queue
+            album['mutex'] = mutex
+            album['target_format'] = target_format
+            album['force'] = force
 
 
-    with Pool(maxtasksperchild=1) as pool:
-        pool.apply_async(update_downloaded_albums, (queue, directory, mutex))
-        pool.map(download_album, albums)
-        queue.put(None)
-        pool.close()
-        pool.join()
+        with Pool(maxtasksperchild=1) as pool:
+            pool.apply_async(update_downloaded_albums, (queue, directory, mutex))
+            pool.map(download_album, albums)
+            queue.put(None)
+            pool.close()
+            pool.join()
 
     # Run rsgain if requested
     if use_rsgain:
