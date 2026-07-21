@@ -50,7 +50,7 @@ python3 main.py mp3 --album <CID>
 python3 main.py flac --song <CID> --rsgain
 ```
 
-> A single song is saved under its parent album folder (`./MonsterSiren/<album>/`) with the album's cover art and metadata, but the album is **not** marked as completed — so a later full run will still download the rest of it. An explicit `--album` request re-downloads even if that album is already in `completed_albums.json`.
+> A single song is saved under its parent album folder (`./MonsterSiren/<album>/`) with the album's cover art and metadata, but the album is **not** marked as completed — `completed_albums.json` is not updated by `--song`. A later full run will still process the album normally (downloading any songs whose CIDs aren't already on disk). An explicit `--album` request re-downloads even if that album is already in `completed_albums.json`.
 
 #### ReplayGain tagging
 
@@ -64,8 +64,9 @@ This runs `rsgain custom -a -si -S` over all downloaded audio files in batches. 
 #### Behavior
 
 - Albums are saved under `./MonsterSiren/<album>/`.
-- Completed albums are tracked in `./MonsterSiren/completed_albums.json`, so re-running the script automatically **skips** albums already downloaded.
-- Albums fetched in the latest run are listed in `./MonsterSiren/new_albums.json`.
+- Completion is tracked per song CID in `./MonsterSiren/completed_albums.json` (schema: `{album_name: [song_cid, ...]}`). Re-running the script skips songs whose CIDs are already recorded, so tracks added to an album *after* its first download are fetched on the next run without re-downloading the rest.
+- The schema is validated on every run. If the file is in an incompatible format (e.g., the legacy list format used before per-CID tracking), the script exits with a remediation message — it will not silently migrate or auto-re-download.
+- Albums that had any download activity in the latest run are listed (as a flat list of album names) in `./MonsterSiren/new_albums.json`.
 
 
 ![image](https://user-images.githubusercontent.com/80285371/207703442-a96488bc-5642-4d7b-92da-f0ac976e944b.png)

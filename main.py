@@ -41,6 +41,45 @@ def make_valid(filename):
     return f
 
 
+def load_completed_albums(path, mutex):
+    """Load and validate completed_albums.json.
+
+    Returns the dict on success. Exits with a remediation message on any
+    format mismatch — callers can assume the return is a dict of
+    {album_name: [cid, ...]}.
+    """
+    try:
+        with mutex:
+            with open(path, 'r', encoding='utf8') as f:
+                data = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as e:
+        _abort_bad_state(path, f"corrupt JSON: {e}")
+
+    if not isinstance(data, dict):
+        _abort_bad_state(path, f"expected dict, got {type(data).__name__}")
+    for name, cids in data.items():
+        if not isinstance(cids, list):
+            _abort_bad_state(
+                path,
+                f"album {name!r} has non-list value {type(cids).__name__}"
+            )
+    return data
+
+
+def _abort_bad_state(path, reason):
+    sys.exit(
+        f"Error: {path} is incompatible ({reason}).\n\n"
+        "The downloader refuses to proceed automatically to avoid an "
+        "accidental full library re-download. Either:\n\n"
+        "  1. Migrate (preserves existing downloads):\n"
+        "       python /scripts/audit-library.py --apply\n\n"
+        "  2. Discard state and re-download everything:\n"
+        f"       rm {path} && python main.py mp3 --rsgain\n"
+    )
+
+
 def lyric_file_to_text(filename):
     lrc_file = open(filename, 'r', encoding='utf-8')
     lrc_string = ''.join(lrc_file.readlines())
@@ -54,33 +93,38 @@ def lyric_file_to_text(filename):
     return ret
 
 def update_downloaded_albums(queue, directory, mutex):
-    """Collects albums downloaded in current session and writes to both completed_albums.json and new_albums.json"""
-    new_albums = []
-    while True:
-        album_name = queue.get()
-        # Final queue element, guaranteed to happen after all maps completed
-        if album_name is None:
-            break
-        new_albums.append(album_name)
+    """Collects albums downloaded in current session and writes to both
+    completed_albums.json and new_albums.json.
 
-    # Read existing completed albums
-    try:
-        with mutex:
-            with open(directory + 'completed_albums.json', 'r', encoding='utf8') as f:
-                completed_albums = json.load(f)
-    except:
-        completed_albums = []
+    Queue items are (album_name, [song_cids]) tuples. The CID list is the
+    authoritative set of songs the album currently contains per the API —
+    it replaces any previously stored list for that album, so tracks added
+    after first download are correctly tracked.
+    """
+    updated = []  # list of (name, [cids])
+    while True:
+        item = queue.get()
+        # Final queue element, guaranteed to happen after all maps completed
+        if item is None:
+            break
+        updated.append(item)
+
+    state_path = directory + 'completed_albums.json'
+    completed_albums = load_completed_albums(state_path, mutex)
 
     # Append new albums to completed_albums.json
-    completed_albums.extend(new_albums)
+    for album_name, cids in updated:
+        completed_albums[album_name] = cids
+
     with mutex:
-        with open(directory + 'completed_albums.json', 'w+', encoding='utf8') as f:
-            json.dump(completed_albums, f)
+        with open(state_path, 'w+', encoding='utf8') as f:
+            json.dump(completed_albums, f, ensure_ascii=False, indent=2)
 
     # Write new albums from this session to new_albums.json (overwrite)
+    new_album_names = [name for name, _ in updated]
     with mutex:
         with open(directory + 'new_albums.json', 'w', encoding='utf8') as f:
-            json.dump(new_albums, f, ensure_ascii=False, indent=2)
+            json.dump(new_album_names, f, ensure_ascii=False, indent=2)
 
 
 def run_rsgain(directory):
@@ -230,29 +274,41 @@ def download_album(args):
     album_artistes = args['artistes']
     album_url = 'https://monster-siren.hypergryph.com/api/album/' + album_cid + '/detail'
 
-    try:
-        with mutex:
-            with open(directory + 'completed_albums.json', 'r', encoding='utf8') as f:
-                completed_albums = json.load(f)
-    except:
-        completed_albums = []
+    # Fetch the authoritative song list first.
+    # Skip if there are no new tracks in an album.
+    songs = session.get(album_url, headers={'Accept': 'application/json'}).json()['data']['songs']
+    all_cids = [s['cid'] for s in songs]
 
-    if album_name in completed_albums and not force:
-        # If album is completed then skip
+    completed_albums = load_completed_albums(
+        directory + 'completed_albums.json', mutex
+    )
+    stored_cids = completed_albums.get(album_name, [])
+
+    if force:
+        pending = songs
+    elif not stored_cids:
+        pending = songs
+    else:
+        pending = [s for s in songs if s['cid'] not in stored_cids]
+
+    if not pending:
         print(f'Skipping downloaded album {album_name}')
+        queue.put((album_name, all_cids))
         return
 
     try:
         os.mkdir(directory + make_valid(album_name))
-    except:
+    except FileExistsError:
         pass
 
     # Download album art
     download_album_cover(session, directory + make_valid(album_name), album_coverUrl)
 
-
-    songs = session.get(album_url, headers={'Accept': 'application/json'}).json()['data']['songs']
+    pending_cid_set = {s['cid'] for s in pending}
     for song_track_number, song in enumerate(songs):
+        if song['cid'] not in pending_cid_set:
+            continue
+
         # Get song details
         song_cid = song['cid']
         song_name = song['name']
@@ -283,7 +339,7 @@ def download_album(args):
                         songlyricpath=songlyricpath)
     
     # Mark album as finished
-    queue.put(album_name)
+    queue.put((album_name, all_cids))
 
     return
 
