@@ -301,8 +301,10 @@ def download_album(args):
     except FileExistsError:
         pass
 
-    # Download album art
-    download_album_cover(session, directory + make_valid(album_name), album_coverUrl)
+    # Download album art (skip if cover already exists)
+    album_dir = directory + make_valid(album_name)
+    if not os.path.exists(album_dir + '/cover.png'):
+        download_album_cover(session, album_dir, album_coverUrl)
 
     pending_cid_set = {s['cid'] for s in pending}
     for song_track_number, song in enumerate(songs):
@@ -379,7 +381,8 @@ def download_single_song(session, directory, target_format, song_cid, albums):
     except:
         pass
 
-    download_album_cover(session, album_dir, album_coverUrl)
+    if not os.path.exists(album_dir + '/cover.png'):
+        download_album_cover(session, album_dir, album_coverUrl)
 
     # Get song details (lyric + source)
     song_url = 'https://monster-siren.hypergryph.com/api/song/' + song_cid
